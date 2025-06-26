@@ -9,22 +9,21 @@ import {
 import { google } from 'googleapis';
 import { z } from "zod";
 import { zodToJsonSchema } from "zod-to-json-schema";
-import { OAuth2Client } from 'google-auth-library';
+import { Credentials, OAuth2Client } from 'google-auth-library';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import http from 'http';
 import open from 'open';
-import os from 'os';
 import {createEmailMessage, createEmailWithNodemailer} from "./utl.js";
 import { createLabel, updateLabel, deleteLabel, listLabels, findLabelByName, getOrCreateLabel, GmailLabel } from "./label-manager.js";
+import dotenv from 'dotenv';
+
+dotenv.config();
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-// Configuration paths
-const CONFIG_DIR = path.join(os.homedir(), '.gmail-mcp');
-const OAUTH_PATH = process.env.GMAIL_OAUTH_PATH || path.join(CONFIG_DIR, 'gcp-oauth.keys.json');
-const CREDENTIALS_PATH = process.env.GMAIL_CREDENTIALS_PATH || path.join(CONFIG_DIR, 'credentials.json');
+// Note: All credentials are now loaded from environment variables
 
 // Type definitions for Gmail API responses
 interface GmailMessagePart {
@@ -83,8 +82,12 @@ function extractEmailContent(messagePart: GmailMessagePart): EmailContent {
     if (messagePart.parts && messagePart.parts.length > 0) {
         for (const part of messagePart.parts) {
             const { text, html } = extractEmailContent(part);
-            if (text) textContent += text;
-            if (html) htmlContent += html;
+            if (text) {
+                textContent += text;
+            }
+            if (html) {
+                htmlContent += html;
+            }
         }
     }
 
@@ -94,47 +97,40 @@ function extractEmailContent(messagePart: GmailMessagePart): EmailContent {
 
 async function loadCredentials() {
     try {
-        // Create config directory if it doesn't exist
-        if (!process.env.GMAIL_OAUTH_PATH && !CREDENTIALS_PATH &&!fs.existsSync(CONFIG_DIR)) {
-            fs.mkdirSync(CONFIG_DIR, { recursive: true });
-        }
+        // Load OAuth client credentials from environment variables
+        const clientId = process.env.GMAIL_CLIENT_ID;
+        const clientSecret = process.env.GMAIL_CLIENT_SECRET;
 
-        // Check for OAuth keys in current directory first, then in config directory
-        const localOAuthPath = path.join(process.cwd(), 'gcp-oauth.keys.json');
-        let oauthPath = OAUTH_PATH;
-
-        if (fs.existsSync(localOAuthPath)) {
-            // If found in current directory, copy to config directory
-            fs.copyFileSync(localOAuthPath, OAUTH_PATH);
-            console.log('OAuth keys found in current directory, copied to global config.');
-        }
-
-        if (!fs.existsSync(OAUTH_PATH)) {
-            console.error('Error: OAuth keys file not found. Please place gcp-oauth.keys.json in current directory or', CONFIG_DIR);
-            process.exit(1);
-        }
-
-        const keysContent = JSON.parse(fs.readFileSync(OAUTH_PATH, 'utf8'));
-        const keys = keysContent.installed || keysContent.web;
-
-        if (!keys) {
-            console.error('Error: Invalid OAuth keys file format. File should contain either "installed" or "web" credentials.');
+        if (!clientId || !clientSecret) {
+            const errorMsg = 'Error: GMAIL_CLIENT_ID and GMAIL_CLIENT_SECRET environment variables are required.';
+            console.error(errorMsg);
             process.exit(1);
         }
 
         const callback = process.argv[2] === 'auth' && process.argv[3] 
-        ? process.argv[3] 
-        : "http://localhost:3000/oauth2callback";
+            ? process.argv[3] 
+            : "http://localhost:3000/api/auth/callback/google";
 
         oauth2Client = new OAuth2Client(
-            keys.client_id,
-            keys.client_secret,
+            clientId,
+            clientSecret,
             callback
         );
 
-        if (fs.existsSync(CREDENTIALS_PATH)) {
-            const credentials = JSON.parse(fs.readFileSync(CREDENTIALS_PATH, 'utf8'));
-            oauth2Client.setCredentials(credentials);
+        // Load user credentials from environment variables if available
+        const accessToken = process.env.GMAIL_ACCESS_TOKEN;
+        const refreshToken = process.env.GMAIL_REFRESH_TOKEN;
+        const idToken = process.env.GMAIL_ID_TOKEN;
+        const tokenType = process.env.GMAIL_TOKEN_TYPE;
+
+        if (accessToken || refreshToken) {
+            const creds: Credentials = {
+                access_token: accessToken,
+                refresh_token: refreshToken,
+                id_token: idToken,
+                token_type: tokenType,
+            };
+            oauth2Client.setCredentials(creds);
         }
     } catch (error) {
         console.error('Error loading credentials:', error);
@@ -149,7 +145,7 @@ async function authenticate() {
     return new Promise<void>((resolve, reject) => {
         const authUrl = oauth2Client.generateAuthUrl({
             access_type: 'offline',
-            scope: ['https://www.googleapis.com/auth/gmail.modify'],
+            scope: ['openid profile email https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/gmail.send'],
         });
 
         console.log('Please visit this URL to authenticate:', authUrl);
@@ -171,10 +167,16 @@ async function authenticate() {
             try {
                 const { tokens } = await oauth2Client.getToken(code);
                 oauth2Client.setCredentials(tokens);
-                fs.writeFileSync(CREDENTIALS_PATH, JSON.stringify(tokens));
+                
+                // Display tokens for user to add to environment variables
+                console.log('\nAuthentication successful! Add these tokens to your environment variables:');
+                console.log(`GMAIL_ACCESS_TOKEN=${tokens.access_token}`);
+                console.log(`GMAIL_REFRESH_TOKEN=${tokens.refresh_token}`);
+                if (tokens.id_token) console.log(`GMAIL_ID_TOKEN=${tokens.id_token}`);
+                if (tokens.token_type) console.log(`GMAIL_TOKEN_TYPE=${tokens.token_type}`);
 
                 res.writeHead(200);
-                res.end('Authentication successful! You can close this window.');
+                res.end('Authentication successful! Check your console for environment variables to set.');
                 server.close();
                 resolve();
             } catch (error) {
@@ -279,7 +281,11 @@ async function main() {
     }
 
     // Initialize Gmail API
-    const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
+    const gmail = google.gmail({ 
+        version: 'v1', 
+        auth: oauth2Client,
+        errorRedactor: false
+    });
 
     // Server implementation
     const server = new Server({
@@ -291,80 +297,82 @@ async function main() {
     });
 
     // Tool handlers
-    server.setRequestHandler(ListToolsRequestSchema, async () => ({
-        tools: [
-            {
-                name: "send_email",
-                description: "Sends a new email",
-                inputSchema: zodToJsonSchema(SendEmailSchema),
-            },
-            {
-                name: "draft_email",
-                description: "Draft a new email",
-                inputSchema: zodToJsonSchema(SendEmailSchema),
-            },
-            {
-                name: "read_email",
-                description: "Retrieves the content of a specific email",
-                inputSchema: zodToJsonSchema(ReadEmailSchema),
-            },
-            {
-                name: "search_emails",
-                description: "Searches for emails using Gmail search syntax",
-                inputSchema: zodToJsonSchema(SearchEmailsSchema),
-            },
-            {
-                name: "modify_email",
-                description: "Modifies email labels (move to different folders)",
-                inputSchema: zodToJsonSchema(ModifyEmailSchema),
-            },
-            {
-                name: "delete_email",
-                description: "Permanently deletes an email",
-                inputSchema: zodToJsonSchema(DeleteEmailSchema),
-            },
-            {
-                name: "list_email_labels",
-                description: "Retrieves all available Gmail labels",
-                inputSchema: zodToJsonSchema(ListEmailLabelsSchema),
-            },
-            {
-                name: "batch_modify_emails",
-                description: "Modifies labels for multiple emails in batches",
-                inputSchema: zodToJsonSchema(BatchModifyEmailsSchema),
-            },
-            {
-                name: "batch_delete_emails",
-                description: "Permanently deletes multiple emails in batches",
-                inputSchema: zodToJsonSchema(BatchDeleteEmailsSchema),
-            },
-            {
-                name: "create_label",
-                description: "Creates a new Gmail label",
-                inputSchema: zodToJsonSchema(CreateLabelSchema),
-            },
-            {
-                name: "update_label",
-                description: "Updates an existing Gmail label",
-                inputSchema: zodToJsonSchema(UpdateLabelSchema),
-            },
-            {
-                name: "delete_label",
-                description: "Deletes a Gmail label",
-                inputSchema: zodToJsonSchema(DeleteLabelSchema),
-            },
-            {
-                name: "get_or_create_label",
-                description: "Gets an existing label by name or creates it if it doesn't exist",
-                inputSchema: zodToJsonSchema(GetOrCreateLabelSchema),
-            },
-            {
-                name: "download_attachment",
-                description: "Downloads an email attachment to a specified location",
-                inputSchema: zodToJsonSchema(DownloadAttachmentSchema),
-            },
-        ],
-    }))
+    server.setRequestHandler(ListToolsRequestSchema, async () => {
+        return {
+            tools: [
+                {
+                    name: "send_email",
+                    description: "Sends a new email",
+                    inputSchema: zodToJsonSchema(SendEmailSchema),
+                },
+                {
+                    name: "draft_email",
+                    description: "Draft a new email",
+                    inputSchema: zodToJsonSchema(SendEmailSchema),
+                },
+                {
+                    name: "read_email",
+                    description: "Retrieves the content of a specific email",
+                    inputSchema: zodToJsonSchema(ReadEmailSchema),
+                },
+                {
+                    name: "search_emails",
+                    description: "Searches for emails using Gmail search syntax",
+                    inputSchema: zodToJsonSchema(SearchEmailsSchema),
+                },
+                {
+                    name: "modify_email",
+                    description: "Modifies email labels (move to different folders)",
+                    inputSchema: zodToJsonSchema(ModifyEmailSchema),
+                },
+                {
+                    name: "delete_email",
+                    description: "Permanently deletes an email",
+                    inputSchema: zodToJsonSchema(DeleteEmailSchema),
+                },
+                {
+                    name: "list_email_labels",
+                    description: "Retrieves all available Gmail labels",
+                    inputSchema: zodToJsonSchema(ListEmailLabelsSchema),
+                },
+                {
+                    name: "batch_modify_emails",
+                    description: "Modifies labels for multiple emails in batches",
+                    inputSchema: zodToJsonSchema(BatchModifyEmailsSchema),
+                },
+                {
+                    name: "batch_delete_emails",
+                    description: "Permanently deletes multiple emails in batches",
+                    inputSchema: zodToJsonSchema(BatchDeleteEmailsSchema),
+                },
+                {
+                    name: "create_label",
+                    description: "Creates a new Gmail label",
+                    inputSchema: zodToJsonSchema(CreateLabelSchema),
+                },
+                {
+                    name: "update_label",
+                    description: "Updates an existing Gmail label",
+                    inputSchema: zodToJsonSchema(UpdateLabelSchema),
+                },
+                {
+                    name: "delete_label",
+                    description: "Deletes a Gmail label",
+                    inputSchema: zodToJsonSchema(DeleteLabelSchema),
+                },
+                {
+                    name: "get_or_create_label",
+                    description: "Gets an existing label by name or creates it if it doesn't exist",
+                    inputSchema: zodToJsonSchema(GetOrCreateLabelSchema),
+                },
+                {
+                    name: "download_attachment",
+                    description: "Downloads an email attachment to a specified location",
+                    inputSchema: zodToJsonSchema(DownloadAttachmentSchema),
+                },
+            ],
+        };
+    })
 
     server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const { name, arguments: args } = request.params;
@@ -418,6 +426,7 @@ async function main() {
                                 message: messageRequest,
                             },
                         });
+                        
                         return {
                             content: [
                                 {
@@ -456,6 +465,7 @@ async function main() {
                             userId: 'me',
                             requestBody: messageRequest,
                         });
+                        
                         return {
                             content: [
                                 {
@@ -471,6 +481,7 @@ async function main() {
                                 message: messageRequest,
                         },
                         });
+                        
                         return {
                             content: [
                                 {
@@ -482,10 +493,6 @@ async function main() {
                     }
                 }
             } catch (error: any) {
-                // Log attachment-related errors for debugging
-                if (validatedArgs.attachments && validatedArgs.attachments.length > 0) {
-                    console.error(`Failed to send email with ${validatedArgs.attachments.length} attachments:`, error.message);
-                }
                 throw error;
             }
         }
@@ -502,6 +509,7 @@ async function main() {
             // Process in batches
             for (let i = 0; i < items.length; i += batchSize) {
                 const batch = items.slice(i, i + batchSize);
+                
                 try {
                     const results = await processFn(batch);
                     successes.push(...results);
@@ -532,6 +540,7 @@ async function main() {
 
                 case "read_email": {
                     const validatedArgs = ReadEmailSchema.parse(args);
+                    
                     const response = await gmail.users.messages.get({
                         userId: 'me',
                         id: validatedArgs.messageId,
@@ -596,42 +605,79 @@ async function main() {
                 }
 
                 case "search_emails": {
-                    const validatedArgs = SearchEmailsSchema.parse(args);
-                    const response = await gmail.users.messages.list({
-                        userId: 'me',
-                        q: validatedArgs.query,
-                        maxResults: validatedArgs.maxResults || 10,
-                    });
+                    try {
+                        const validatedArgs = SearchEmailsSchema.parse(args);
+                        
+                        const response = await gmail.users.messages.list({
+                            userId: 'me',
+                            q: validatedArgs.query,
+                            maxResults: validatedArgs.maxResults || 10,
+                        });
 
-                    const messages = response.data.messages || [];
-                    const results = await Promise.all(
-                        messages.map(async (msg) => {
-                            const detail = await gmail.users.messages.get({
-                                userId: 'me',
-                                id: msg.id!,
-                                format: 'metadata',
-                                metadataHeaders: ['Subject', 'From', 'Date'],
-                            });
-                            const headers = detail.data.payload?.headers || [];
+                        const messages = response.data.messages || [];
+                        
+                        if (messages.length === 0) {
                             return {
-                                id: msg.id,
-                                subject: headers.find(h => h.name === 'Subject')?.value || '',
-                                from: headers.find(h => h.name === 'From')?.value || '',
-                                date: headers.find(h => h.name === 'Date')?.value || '',
+                                content: [
+                                    {
+                                        type: "text",
+                                        text: `No messages found for query: ${validatedArgs.query}`,
+                                    },
+                                ],
                             };
-                        })
-                    );
+                        }
+                        
+                        const results = await Promise.all(
+                            messages.map(async (msg, index) => {
+                                try {
+                                    const detail = await gmail.users.messages.get({
+                                        userId: 'me',
+                                        id: msg.id!,
+                                        format: 'metadata',
+                                        metadataHeaders: ['Subject', 'From', 'Date'],
+                                    });
+                                    
+                                    const headers = detail.data.payload?.headers || [];
+                                    
+                                    return {
+                                        id: msg.id,
+                                        subject: headers.find(h => h.name === 'Subject')?.value || '',
+                                        from: headers.find(h => h.name === 'From')?.value || '',
+                                        date: headers.find(h => h.name === 'Date')?.value || '',
+                                    };
+                                } catch (error) {
+                                    return {
+                                        id: msg.id,
+                                        subject: '[Error loading subject]',
+                                        from: '[Error loading sender]',
+                                        date: '[Error loading date]',
+                                    };
+                                }
+                            })
+                        );
 
-                    return {
-                        content: [
-                            {
-                                type: "text",
-                                text: results.map(r =>
-                                    `ID: ${r.id}\nSubject: ${r.subject}\nFrom: ${r.from}\nDate: ${r.date}\n`
-                                ).join('\n'),
-                            },
-                        ],
-                    };
+                        const formattedResults = results.map(r =>
+                            `ID: ${r.id}\nSubject: ${r.subject}\nFrom: ${r.from}\nDate: ${r.date}\n`
+                        ).join('\n');
+
+                        return {
+                            content: [
+                                {
+                                    type: "text",
+                                    text: formattedResults,
+                                },
+                            ],
+                        };
+                    } catch (error) {
+                        return {
+                            content: [
+                                {
+                                    type: "text",
+                                    text: `Failed to search emails: ${error instanceof Error ? error.message : 'Unknown error'}`,
+                                },
+                            ],
+                        };
+                    }
                 }
 
                 // Updated implementation for the modify_email handler
@@ -671,6 +717,7 @@ async function main() {
 
                 case "delete_email": {
                     const validatedArgs = DeleteEmailSchema.parse(args);
+                    
                     await gmail.users.messages.delete({
                         userId: 'me',
                         id: validatedArgs.messageId,
@@ -812,6 +859,7 @@ async function main() {
                 // New label management handlers
                 case "create_label": {
                     const validatedArgs = CreateLabelSchema.parse(args);
+                    
                     const result = await createLabel(gmail, validatedArgs.name, {
                         messageListVisibility: validatedArgs.messageListVisibility,
                         labelListVisibility: validatedArgs.labelListVisibility,
@@ -850,6 +898,7 @@ async function main() {
 
                 case "delete_label": {
                     const validatedArgs = DeleteLabelSchema.parse(args);
+                    
                     const result = await deleteLabel(gmail, validatedArgs.id);
 
                     return {
@@ -864,6 +913,7 @@ async function main() {
 
                 case "get_or_create_label": {
                     const validatedArgs = GetOrCreateLabelSchema.parse(args);
+                    
                     const result = await getOrCreateLabel(gmail, validatedArgs.name, {
                         messageListVisibility: validatedArgs.messageListVisibility,
                         labelListVisibility: validatedArgs.labelListVisibility,
